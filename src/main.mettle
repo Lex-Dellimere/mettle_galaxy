@@ -1,0 +1,254 @@
+// Two galaxies colliding. Gravity between every pair of stars and the
+// drawing both run in Mettle kernels on the GPU; the window shows the
+// finished picture.
+//
+//   galaxy                          32,768 stars in a window
+//   galaxy --stars 131072
+//   galaxy --headless out.ppm --steps 3000 [--record DIR --every 8]
+//   galaxy --bench                  time the gravity step at several sizes
+//
+// Drag to turn around, scroll to zoom, Space pauses, R starts again, [ and ]
+// change how many steps run each frame, A turns the slow spin on and off,
+// Escape quits.
+import "std/io";
+import "std/mem";
+import "std/conv";
+import "std/file";
+import "std/gpu";
+import "std/math" as m;
+import "window/window";
+import "sim.mettle";
+import "render.mettle";
+
+const W: int32 = 1280;
+const H: int32 = 720;
+
+struct Orbit { yaw: float64; pitch: float64; dist: float64; }
+
+fn make_cam(o: Orbit) -> GalCam {
+  var cp: float64 = m.cos(o.pitch);
+  var ex: float64 = o.dist * cp * m.sin(o.yaw);
+  var ey: float64 = o.dist * m.sin(o.pitch);
+  var ez: float64 = o.dist * cp * m.cos(o.yaw);
+  // forward points from the eye to the middle
+  var fl: float64 = m.sqrt(ex * ex + ey * ey + ez * ez);
+  var fx: float64 = -ex / fl; var fy: float64 = -ey / fl; var fz: float64 = -ez / fl;
+  // right = forward x up(0,1,0); up = right x forward
+  var rx: float64 = -fz; var ry: float64 = 0.0; var rz: float64 = fx;
+  var rl: float64 = m.sqrt(rx * rx + rz * rz);
+  rx = rx / rl; rz = rz / rl;
+  var ux: float64 = ry * fz - rz * fy;
+  var uy: float64 = rz * fx - rx * fz;
+  var uz: float64 = rx * fy - ry * fx;
+  var c: GalCam;
+  c.ex = (float32)ex; c.ey = (float32)ey; c.ez = (float32)ez;
+  c.rx = (float32)rx; c.ry = (float32)ry; c.rz = (float32)rz;
+  c.ux = (float32)ux; c.uy = (float32)uy; c.uz = (float32)uz;
+  c.fx = (float32)fx; c.fy = (float32)fy; c.fz = (float32)fz;
+  c.focal = (float32)((float64)H * 1.07);
+  c.w = W;
+  c.h = H;
+  return c;
+}
+
+fn home() -> Orbit {
+  var o: Orbit;
+  o.yaw = 0.35;
+  o.pitch = 0.75;
+  o.dist = 62.0;
+  return o;
+}
+
+// stars are fainter the more of them there are, so the total light stays about the same
+fn brightness(n: int32) -> float32 { return (float32)(0.9 * 65536.0 / (float64)n); }
+
+fn parse_int(c: cstring) -> int32 {
+  var v: int32 = 0;
+  var i: int32 = 0;
+  while (c[i] >= (uint8)48 && c[i] <= (uint8)57) { v = v * 10 + (int32)(c[i] - (uint8)48); i += 1; }
+  return v;
+}
+
+fn fixed1(v: float64) -> string {
+  var t: int64 = (int64)(v * 10.0 + 0.5);
+  return "{t / 10}.{t % 10}";
+}
+
+fn now_ms() -> float64 { return (float64)window_now_us() / 1000.0; }
+
+fn save_ppm(px: uint8*, path: string) -> bool {
+  var fd: int64 = file_open(path, FILE_WRITE | FILE_CREATE | FILE_TRUNCATE);
+  if (fd < 0) { return false; }
+  var head: string = "P6\n{W} {H}\n255\n";
+  var at: int64 = file_write_at(fd, head.chars, (int64)head.length, 0);
+  var row: uint8* = (uint8*)malloc((int64)W * 3);
+  for y in 0..H {
+    for x in 0..W {
+      var o: int64 = ((int64)y * (int64)W + (int64)x) * 4;
+      row[x * 3] = px[o]; row[x * 3 + 1] = px[o + 1]; row[x * 3 + 2] = px[o + 2];
+    }
+    at = at + file_write_at(fd, row, (int64)W * 3, at);
+  }
+  free((rawptr)row);
+  file_close(fd);
+  return true;
+}
+
+fn frame_path(dir: string, i: int32) -> string {
+  var n: string = "{i}";
+  if (i < 10) { n = "000{i}"; } else if (i < 100) { n = "00{i}"; } else if (i < 1000) { n = "0{i}"; }
+  return dir + "/" + n + ".ppm";
+}
+
+// Time the gravity step at several star counts.
+fn bench() -> int32 {
+  var sizes: int32[4] = [16384, 32768, 65536, 131072];
+  for k in 0..4 {
+    var g: Galaxy* = gal_new(sizes[k], (uint64)1);
+    if (!gal_upload(g)) { println("no GPU memory"); return 1; }
+    for s in 0..5 { gal_step(g); }
+    gpu_sync();
+    var steps: int32 = 40;
+    var t0: float64 = now_ms();
+    for s in 0..steps { gal_step(g); }
+    gpu_sync();
+    var ms: float64 = (now_ms() - t0) / (float64)steps;
+    var pairs: float64 = (float64)g->n * (float64)g->n / (ms / 1000.0) / 1e9;
+    println("{g->n} stars: {fixed1(ms)} ms a step, {(int64)pairs} billion pairs a second");
+    gal_free(g);
+  }
+  return 0;
+}
+
+fn headless(stars: int32, steps: int32, out: string, record: string, every: int32) -> int32 {
+  var g: Galaxy* = gal_new(stars, (uint64)1);
+  if (!gal_upload(g)) { println("no GPU memory"); return 1; }
+  var v: GalView* = gal_view_new(W, H);
+  var o: Orbit = home();
+  var frame: int32 = 0;
+  var t0: float64 = now_ms();
+  for s in 0..steps {
+    gal_step(g);
+    if (record.length > (uint64)0 && s % every == 0) {
+      o.yaw = o.yaw + 0.0015 * (float64)every;
+      gal_draw(v, g->d_pos, g->d_vel, g->n, make_cam(o), brightness(g->n), (float32)0.5);
+      save_ppm(v->px, frame_path(record, frame));
+      frame += 1;
+    }
+  }
+  gal_draw(v, g->d_pos, g->d_vel, g->n, make_cam(o), brightness(g->n), (float32)0.5);
+  save_ppm(v->px, out);
+  println("{g->n} stars, {steps} steps to time {(int32)g->time} in {fixed1(now_ms() - t0)} ms, {frame} frames saved");
+  gal_view_free(v);
+  gal_free(g);
+  return 0;
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var stars: int32 = 32768;
+  var steps: int32 = 3000;
+  var every: int32 = 8;
+  var out: string = "";
+  var record: string = "";
+  var do_bench: bool = false;
+  var seconds: int32 = 0;
+  var a: int32 = 1;
+  while (a < argc) {
+    var arg: string = str_from_cstr(argv[a]);
+    var more: bool = a + 1 < argc;
+    if (arg == "--stars" && more) { stars = parse_int(argv[a + 1]); a += 1; }
+    else if (arg == "--steps" && more) { steps = parse_int(argv[a + 1]); a += 1; }
+    else if (arg == "--every" && more) { every = parse_int(argv[a + 1]); a += 1; }
+    else if (arg == "--headless" && more) { out = str_from_cstr(argv[a + 1]); a += 1; }
+    else if (arg == "--record" && more) { record = str_from_cstr(argv[a + 1]); a += 1; }
+    else if (arg == "--seconds" && more) { seconds = parse_int(argv[a + 1]); a += 1; }
+    else if (arg == "--bench") { do_bench = true; }
+    a += 1;
+  }
+  if (stars < 512) { stars = 512; }
+  if (every < 1) { every = 1; }
+  if (gpu_init() == 0) { println("no NVIDIA GPU found: this program runs its gravity and drawing on one"); return 1; }
+  if (do_bench) { return bench(); }
+  if (out.length > (uint64)0) { return headless(stars, steps, out, record, every); }
+
+  var g: Galaxy* = gal_new(stars, (uint64)1);
+  if (!gal_upload(g)) { println("not enough GPU memory"); return 1; }
+  var v: GalView* = gal_view_new(W, H);
+  var cfg: WindowConfig;
+  window_config_default(&cfg);
+  cfg.title = "Galaxy";
+  cfg.w = W;
+  cfg.h = H;
+  cfg.resizable = false;
+  cfg.hidpi = false;
+  var win: Window* = window_create(&cfg);
+  if (win == 0) { println("cannot open a window: {window_error()}"); return 1; }
+
+  var o: Orbit = home();
+  var spf: int32 = 5;
+  var paused: bool = false;
+  var spin: bool = true;
+  var dragging: bool = false;
+  var lx: float64 = 0.0; var ly: float64 = 0.0;
+  var frames: int32 = 0;
+  var sim_ms: float64 = 0.0;
+  var last_title: float64 = now_ms();
+  var started: float64 = last_title;
+  var ev: WindowEvent;
+  while (!window_should_close(win)) {
+    while (window_poll(&ev)) {
+      if (ev.kind == WINDOW_EV_KEY_DOWN) {
+        var k: int32 = ev.key;
+        if (k == WINDOW_KEY_ESCAPE) { window_set_should_close(win, true); }
+        else if (k == WINDOW_KEY_SPACE) { paused = !paused; }
+        else if (k == WINDOW_KEY_A) { spin = !spin; }
+        else if (k == WINDOW_KEY_LEFT_BRACKET && spf > 1) { spf -= 1; }
+        else if (k == WINDOW_KEY_RIGHT_BRACKET && spf < 64) { spf += 1; }
+        else if (k == WINDOW_KEY_R) {
+          gal_free(g);
+          g = gal_new(stars, (uint64)1);
+          gal_upload(g);
+        }
+      } else if (ev.kind == WINDOW_EV_MOUSE_DOWN && ev.button == WINDOW_BUTTON_LEFT) {
+        dragging = true; lx = ev.x; ly = ev.y;
+      } else if (ev.kind == WINDOW_EV_MOUSE_UP && ev.button == WINDOW_BUTTON_LEFT) {
+        dragging = false;
+      } else if (ev.kind == WINDOW_EV_MOUSE_MOVE && dragging) {
+        o.yaw = o.yaw - (ev.x - lx) * 0.005;
+        o.pitch = o.pitch + (ev.y - ly) * 0.005;
+        if (o.pitch > 1.5) { o.pitch = 1.5; }
+        if (o.pitch < -1.5) { o.pitch = -1.5; }
+        lx = ev.x; ly = ev.y;
+      } else if (ev.kind == WINDOW_EV_SCROLL) {
+        if (ev.dy > 0.0) { o.dist = o.dist * 0.9; } else if (ev.dy < 0.0) { o.dist = o.dist * 1.1; }
+        if (o.dist < 5.0) { o.dist = 5.0; }
+        if (o.dist > 400.0) { o.dist = 400.0; }
+      }
+    }
+    var t0: float64 = now_ms();
+    if (!paused) {
+      for s in 0..spf { gal_step(g); }
+    }
+    if (spin && !dragging) { o.yaw = o.yaw + 0.0012; }
+    gal_draw(v, g->d_pos, g->d_vel, g->n, make_cam(o), brightness(g->n), (float32)0.5);
+    sim_ms = sim_ms + now_ms() - t0;
+    window_blit(win, v->px, W, H, W * 4);
+    frames += 1;
+    var t: float64 = now_ms();
+    if (t - last_title >= 1000.0) {
+      var fps: int32 = (int32)((float64)frames * 1000.0 / (t - last_title));
+      var title: string = "Galaxy  {g->n} stars  {fps} fps  {spf} steps a frame  GPU {fixed1(sim_ms / (float64)frames)} ms  time {(int32)g->time}";
+      window_set_title(win, title);
+      println(title);
+      frames = 0;
+      sim_ms = 0.0;
+      last_title = t;
+    }
+    if (seconds > 0 && t - started > (float64)seconds * 1000.0) { window_set_should_close(win, true); }
+  }
+  window_destroy(win);
+  window_shutdown();
+  gal_view_free(v);
+  gal_free(g);
+  return 0;
+}

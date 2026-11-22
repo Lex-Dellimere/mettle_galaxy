@@ -1,0 +1,17 @@
+// mettle_galaxy: two galaxies colliding, simulated and drawn by Mettle kernels on the GPU.
+import "mbuild/api";
+
+fn project() {
+  mb_package("mettle_galaxy", "0.1.0");
+  mb_meta("description", "Colliding galaxies, simulated and drawn by Mettle kernels on the GPU");
+  mb_meta("license", "Apache-2.0");
+  mb_targets("linux");
+  mb_bin("galaxy", "src/main.mettle");
+  mb_bin("check", "tests/check.mettle");
+  mb_link_libs("c");
+  mb_agents(false);
+}
+
+fn deps() {
+  mb_dep("window", "0.1.0");
+}

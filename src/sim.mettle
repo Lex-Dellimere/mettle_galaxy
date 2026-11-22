@@ -1,0 +1,222 @@
+// Gravity between every pair of stars, on the GPU, in Mettle kernels.
+//
+// Each star is 4 floats of position (x, y, z, mass) and 4 of velocity
+// (vx, vy, vz, which galaxy it started in). A step works out the pull on
+// every star from every other star, then moves them all. The pull runs in
+// tiles: a block of 256 threads loads 256 stars into workgroup memory, each
+// thread adds their pull on its own two stars, and the block moves to the
+// next 256, so every star is read from global memory once per block instead
+// of once per thread.
+import "std/mem";
+import "std/gpu";
+import "std/math" as m;
+
+export const GAL_TILE: int32 = 256;
+
+export struct Galaxy {
+  n: int32;            // stars, counting the two black holes
+  pos: float32*;       // host copies, 4 floats a star
+  vel: float32*;
+  d_pos: int64;        // device buffers
+  d_vel: int64;
+  d_acc: int64;
+  eps2: float32;       // softening: the pull of a star stops growing closer than sqrt(eps2)
+  dt: float32;
+  time: float64;
+}
+
+// ---------------------------------------------------------------- kernels
+
+kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: float32) {
+  workgroup var sx: float32[256];
+  workgroup var sy: float32[256];
+  workgroup var sz: float32[256];
+  workgroup var sm: float32[256];
+  // each thread works out the pull on two stars, i and i + 256, so each star
+  // loaded into workgroup memory serves twice the work
+  var i: int32 = block.x * 512 + thread.x;
+  var i2: int32 = i + 256;
+  var px: float32 = (float32)0.0; var py: float32 = (float32)0.0; var pz: float32 = (float32)0.0;
+  var qx: float32 = (float32)0.0; var qy: float32 = (float32)0.0; var qz: float32 = (float32)0.0;
+  // black holes pull softly inside one unit, so stars that pass close are not flung away
+  var hp: float32 = (float32)0.0; var hq: float32 = (float32)0.0;
+  if (i < n) { px = pos[i * 4]; py = pos[i * 4 + 1]; pz = pos[i * 4 + 2]; if (pos[i * 4 + 3] > (float32)0.05) { hp = (float32)1.0; } }
+  if (i2 < n) { qx = pos[i2 * 4]; qy = pos[i2 * 4 + 1]; qz = pos[i2 * 4 + 2]; if (pos[i2 * 4 + 3] > (float32)0.05) { hq = (float32)1.0; } }
+  var ax: float32 = (float32)0.0; var ay: float32 = (float32)0.0; var az: float32 = (float32)0.0;
+  var bx: float32 = (float32)0.0; var by: float32 = (float32)0.0; var bz: float32 = (float32)0.0;
+  var tiles: int32 = (n + 255) / 256;
+  for t in 0..tiles {
+    var j: int32 = t * 256 + thread.x;
+    if (j < n) {
+      sx[thread.x] = pos[j * 4];
+      sy[thread.x] = pos[j * 4 + 1];
+      sz[thread.x] = pos[j * 4 + 2];
+      sm[thread.x] = pos[j * 4 + 3];
+    } else {
+      sx[thread.x] = (float32)0.0;
+      sy[thread.x] = (float32)0.0;
+      sz[thread.x] = (float32)0.0;
+      sm[thread.x] = (float32)0.0;
+    }
+    barrier(workgroup, acq_rel);
+    for k in 0..256 {
+      var x: float32 = sx[k]; var y: float32 = sy[k]; var z: float32 = sz[k]; var mk: float32 = sm[k];
+      var hk: float32 = (float32)0.0;
+      if (mk > (float32)0.05) { hk = (float32)1.0; }
+      var dx: float32 = x - px; var dy: float32 = y - py; var dz: float32 = z - pz;
+      var inv: float32 = rsqrtf(dx * dx + dy * dy + dz * dz + eps2 + hk + hp);
+      var s: float32 = mk * inv * inv * inv;
+      ax = ax + dx * s; ay = ay + dy * s; az = az + dz * s;
+      var ex: float32 = x - qx; var ey: float32 = y - qy; var ez: float32 = z - qz;
+      var inv2: float32 = rsqrtf(ex * ex + ey * ey + ez * ez + eps2 + hk + hq);
+      var s2: float32 = mk * inv2 * inv2 * inv2;
+      bx = bx + ex * s2; by = by + ey * s2; bz = bz + ez * s2;
+    }
+    barrier(workgroup, acq_rel);
+  }
+  if (i < n) { acc[i * 4] = ax; acc[i * 4 + 1] = ay; acc[i * 4 + 2] = az; acc[i * 4 + 3] = (float32)0.0; }
+  if (i2 < n) { acc[i2 * 4] = bx; acc[i2 * 4 + 1] = by; acc[i2 * 4 + 2] = bz; acc[i2 * 4 + 3] = (float32)0.0; }
+}
+
+// Semi-implicit Euler: the velocity takes the pull first, then the position
+// takes the new velocity. It keeps orbits closed over long runs, which plain
+// Euler does not.
+kernel(block = 256) gal_move_k(pos: float32*, vel: float32*, acc: float32*, n: int32, dt: float32) {
+  var i: int32 = block.x * block_dim.x + thread.x;
+  if (i >= n) { return; }
+  var vx: float32 = vel[i * 4] + acc[i * 4] * dt;
+  var vy: float32 = vel[i * 4 + 1] + acc[i * 4 + 1] * dt;
+  var vz: float32 = vel[i * 4 + 2] + acc[i * 4 + 2] * dt;
+  vel[i * 4] = vx;
+  vel[i * 4 + 1] = vy;
+  vel[i * 4 + 2] = vz;
+  pos[i * 4] = pos[i * 4] + vx * dt;
+  pos[i * 4 + 1] = pos[i * 4 + 1] + vy * dt;
+  pos[i * 4 + 2] = pos[i * 4 + 2] + vz * dt;
+}
+
+// ---------------------------------------------------------------- starting galaxies
+
+struct Rng { s: uint64; }
+
+fn rnd(r: Rng*) -> float64 {
+  var x: uint64 = r->s;
+  x = x ^ (x << 13);
+  x = x ^ (x >> 7);
+  x = x ^ (x << 17);
+  r->s = x;
+  return (float64)(int64)(x >> 11) / 9007199254740992.0;
+}
+
+fn gauss(r: Rng*) -> float64 {
+  var u: float64 = rnd(r);
+  if (u < 1e-12) { u = 1e-12; }
+  return m.sqrt(-2.0 * m.log(u)) * m.cos(6.283185307179586 * rnd(r));
+}
+
+// A disk galaxy: a black hole of mass `hole` at the centre and `stars` stars
+// of total mass `disk`, spread like an exponential disk with scale length 3,
+// each on a circular orbit around the mass inside it. The disk is tilted by
+// `tilt` about the x axis, then turned by `turn` about the y axis, and the
+// whole galaxy placed at (cx, cy, cz) moving at (vx, vy, vz).
+fn add_galaxy(g: Galaxy*, first: int32, stars: int32, hole: float64, disk: float64,
+              tilt: float64, turn: float64,
+              cx: float64, cy: float64, cz: float64, vx: float64, vy: float64, vz: float64,
+              tag: float32, r: Rng*) {
+  var rd: float64 = 3.0;
+  var rmax: float64 = 14.0;
+  var ct: float64 = m.cos(tilt); var st: float64 = m.sin(tilt);
+  var cu: float64 = m.cos(turn); var su: float64 = m.sin(turn);
+  // the black hole
+  var b: int32 = first * 4;
+  g->pos[b] = (float32)cx; g->pos[b + 1] = (float32)cy; g->pos[b + 2] = (float32)cz; g->pos[b + 3] = (float32)hole;
+  g->vel[b] = (float32)vx; g->vel[b + 1] = (float32)vy; g->vel[b + 2] = (float32)vz; g->vel[b + 3] = tag + (float32)0.5;
+  var ms: float64 = disk / (float64)stars;
+  var tail: float64 = 1.0 - m.exp(-rmax / rd);
+  for k in 0..stars {
+    var rr: float64 = -rd * m.log(1.0 - rnd(r) * tail) + 0.3;
+    var a: float64 = 6.283185307179586 * rnd(r);
+    var x: float64 = rr * m.cos(a);
+    var z: float64 = rr * m.sin(a);
+    var y: float64 = gauss(r) * 0.12 * (1.0 + rr * 0.05);
+    // the mass inside rr: the black hole and the part of the disk inside rr
+    var q: float64 = rr / rd;
+    var inside: float64 = hole + disk * (1.0 - m.exp(-q) * (1.0 + q)) / (1.0 - m.exp(-rmax / rd) * (1.0 + rmax / rd));
+    var vc: float64 = m.sqrt(inside / m.sqrt(rr * rr + 0.04));
+    var ux: float64 = -m.sin(a) * vc + gauss(r) * 0.03;
+    var uz: float64 = m.cos(a) * vc + gauss(r) * 0.03;
+    var uy: float64 = gauss(r) * 0.02;
+    // tilt about x, then turn about y
+    var y1: float64 = y * ct - z * st; var z1: float64 = y * st + z * ct;
+    var uy1: float64 = uy * ct - uz * st; var uz1: float64 = uy * st + uz * ct;
+    var x2: float64 = x * cu + z1 * su; var z2: float64 = -x * su + z1 * cu;
+    var ux2: float64 = ux * cu + uz1 * su; var uz2: float64 = -ux * su + uz1 * cu;
+    var o: int32 = (first + 1 + k) * 4;
+    g->pos[o] = (float32)(cx + x2); g->pos[o + 1] = (float32)(cy + y1); g->pos[o + 2] = (float32)(cz + z2);
+    g->pos[o + 3] = (float32)ms;
+    g->vel[o] = (float32)(vx + ux2); g->vel[o + 1] = (float32)(vy + uy1); g->vel[o + 2] = (float32)(vz + uz2);
+    g->vel[o + 3] = tag;
+  }
+}
+
+// Two galaxies on a parabolic orbit that brings them within about 8 units of
+// each other, the bigger one spinning the same way it orbits: the setup
+// Toomre and Toomre used in 1972 to explain long tidal tails. `stars` counts
+// the stars of both, plus their two black holes.
+export fn gal_new(stars: int32, seed: uint64) -> Galaxy* {
+  var g: Galaxy* = new Galaxy;
+  var each: int32 = (stars - 2) / 2;
+  g->n = 2 + each * 2;
+  g->pos = (float32*)calloc((int64)g->n * 4, 4);
+  g->vel = (float32*)calloc((int64)g->n * 4, 4);
+  g->eps2 = (float32)0.04;
+  g->dt = (float32)0.025;
+  var r: Rng;
+  r.s = seed * (uint64)0x9E3779B97F4A7C15 + (uint64)1;
+  // masses 2 and 1.6, 28 apart along x; relative velocity of a parabola with
+  // pericentre 8, split by mass so the centre of mass stays still
+  add_galaxy(g, 0, each, 1.0, 1.0, 0.0, 0.0, -12.44, 0.0, 0.0, 0.190, 0.0, -0.120, (float32)0.0, &r);
+  add_galaxy(g, 1 + each, each, 0.8, 0.8, 0.9, 0.6, 15.56, 0.0, 0.0, -0.238, 0.0, 0.151, (float32)1.0, &r);
+  return g;
+}
+
+// Copy the stars to the GPU. Returns false when there is no GPU.
+export fn gal_upload(g: Galaxy*) -> bool {
+  var bytes: int64 = (int64)g->n * 16;
+  if (g->d_pos == 0) {
+    g->d_pos = gpu_malloc(bytes);
+    g->d_vel = gpu_malloc(bytes);
+    g->d_acc = gpu_malloc(bytes);
+    if (g->d_pos == 0 || g->d_vel == 0 || g->d_acc == 0) { return false; }
+  }
+  gpu_to_device(g->d_pos, (uint8*)g->pos, bytes);
+  gpu_to_device(g->d_vel, (uint8*)g->vel, bytes);
+  return true;
+}
+
+export fn gal_download(g: Galaxy*) {
+  var bytes: int64 = (int64)g->n * 16;
+  gpu_to_host((uint8*)g->pos, g->d_pos, bytes);
+  gpu_to_host((uint8*)g->vel, g->d_vel, bytes);
+}
+
+// The pull on every star, into d_acc.
+// the forces kernel covers 512 stars a block of 256 threads
+fn force_blocks(n: int32) -> int32 { return (n + 511) / 512; }
+
+export fn gal_forces(g: Galaxy*) {
+  dispatch gal_forces_k[force_blocks(g->n), 256](g->d_pos, g->d_acc, g->n, g->eps2);
+}
+
+export fn gal_step(g: Galaxy*) {
+  dispatch gal_forces_k[force_blocks(g->n), 256](g->d_pos, g->d_acc, g->n, g->eps2);
+  dispatch gal_move_k[work: g->n](g->d_pos, g->d_vel, g->d_acc, g->n, g->dt);
+  g->time = g->time + (float64)g->dt;
+}
+
+export fn gal_free(g: Galaxy*) {
+  if (g->d_pos != 0) { gpu_free(g->d_pos); gpu_free(g->d_vel); gpu_free(g->d_acc); }
+  free((rawptr)g->pos);
+  free((rawptr)g->vel);
+  free((rawptr)g);
+}
