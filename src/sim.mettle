@@ -1,5 +1,3 @@
-// gravity between every pair of stars on the GPU
-
 import "std/mem";
 import "std/gpu";
 import "std/math" as m;
@@ -16,17 +14,18 @@ export struct Galaxy {
   eps2: float32;  // softening squared
   dt: float32;
   time: float64;
-  holes: int32[2];  // where the two black holes sit
+  holes: int32[2];
 }
 
-// tiles of 256 stars so each block shares its loads
-kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: float32, hole0: int32, hole1: int32) {
+// tiles of 256 stars shared by each block
+kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: float32,
+                                 hole0: int32, hole1: int32) {
   workgroup var sx: float32[256];
   workgroup var sy: float32[256];
   workgroup var sz: float32[256];
   workgroup var sm: float32[256];
 
-  // each thread does stars i and i + 256 to reuse each load
+  // two stars a thread, so each load does twice the work
   var i: int32 = block.x * 512 + thread.x;
   var i2: int32 = i + 256;
   var px: float32 = (float32)0.0;
@@ -36,7 +35,7 @@ kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: f
   var qy: float32 = (float32)0.0;
   var qz: float32 = (float32)0.0;
 
-  // black holes (mass over 0.05) pull softly inside one unit
+  // black holes pull softly inside one unit
   var hp: float32 = (float32)0.0;
   var hq: float32 = (float32)0.0;
   if (i < n) {
@@ -71,7 +70,7 @@ kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: f
       sy[thread.x] = pos[j * 4 + 1];
       sz[thread.x] = pos[j * 4 + 2];
 
-      // the black holes weigh nothing here and pull after the tiles
+      // holes weigh nothing here and pull after
       var mj: float32 = pos[j * 4 + 3];
       if (j == hole0 || j == hole1) {
         mj = (float32)0.0;
@@ -179,7 +178,7 @@ struct Rng {
   s: uint64;
 }
 
-// xorshift64 with the top 53 bits scaled to [0, 1)
+// xorshift64, top 53 bits to [0, 1)
 fn rnd(r: Rng*) -> float64 {
   var x: uint64 = r->s;
   x = x ^ (x << 13);
@@ -197,7 +196,6 @@ fn gauss(r: Rng*) -> float64 {
   return m.sqrt(-2.0 * m.log(u)) * m.cos(6.283185307179586 * rnd(r));
 }
 
-// a disk of stars on circular orbits round a black hole
 fn add_galaxy(g: Galaxy*, first: int32, stars: int32, hole: float64, disk: float64,
               tilt: float64, turn: float64,
               cx: float64, cy: float64, cz: float64, vx: float64, vy: float64, vz: float64,
@@ -222,6 +220,7 @@ fn add_galaxy(g: Galaxy*, first: int32, stars: int32, hole: float64, disk: float
 
   var ms: float64 = disk / (float64)stars;
   var tail: float64 = 1.0 - m.exp(-rmax / rd);
+  var all: float64 = 1.0 - m.exp(-rmax / rd) * (1.0 + rmax / rd);
 
   for k in 0..stars {
     // exponential radius, cut off at rmax
@@ -229,12 +228,12 @@ fn add_galaxy(g: Galaxy*, first: int32, stars: int32, hole: float64, disk: float
     var a: float64 = 6.283185307179586 * rnd(r);
     var x: float64 = rr * m.cos(a);
     var z: float64 = rr * m.sin(a);
-    // the disk thickens a little further out
+    // thicker further out
     var y: float64 = gauss(r) * 0.12 * (1.0 + rr * 0.05);
 
     // the hole plus the share of disk mass inside rr
     var q: float64 = rr / rd;
-    var inside: float64 = hole + disk * (1.0 - m.exp(-q) * (1.0 + q)) / (1.0 - m.exp(-rmax / rd) * (1.0 + rmax / rd));
+    var inside: float64 = hole + disk * (1.0 - m.exp(-q) * (1.0 + q)) / all;
     var vc: float64 = m.sqrt(inside / m.sqrt(rr * rr + 0.04));
     var ux: float64 = -m.sin(a) * vc + gauss(r) * 0.03;
     var uz: float64 = m.cos(a) * vc + gauss(r) * 0.03;
@@ -262,8 +261,7 @@ fn add_galaxy(g: Galaxy*, first: int32, stars: int32, hole: float64, disk: float
   }
 }
 
-// the 1972 Toomre setup, a parabolic pass about 8 apart
-// stars counts both galaxies and their black holes
+// Toomre 1972, a parabolic pass about 8 apart
 export fn gal_new(stars: int32, seed: uint64) -> Galaxy* {
   var g: Galaxy* = new Galaxy;
   var each: int32 = (stars - 2) / 2;
@@ -275,13 +273,15 @@ export fn gal_new(stars: int32, seed: uint64) -> Galaxy* {
   g->eps2 = (float32)0.04;
   g->dt = (float32)0.025;
 
-  // golden ratio multiply spreads out small seeds
+  // spreads out small seeds
   var r: Rng;
   r.s = seed * (uint64)0x9E3779B97F4A7C15 + (uint64)1;
 
   // masses 2 and 1.6, 28 apart, centre of mass at rest
-  add_galaxy(g, 0, each, 1.0, 1.0, 0.0, 0.0, -12.44, 0.0, 0.0, 0.190, 0.0, -0.120, (float32)0.0, &r);
-  add_galaxy(g, 1 + each, each, 0.8, 0.8, 0.9, 0.6, 15.56, 0.0, 0.0, -0.238, 0.0, 0.151, (float32)1.0, &r);
+  add_galaxy(g, 0, each, 1.0, 1.0, 0.0, 0.0,
+             -12.44, 0.0, 0.0, 0.190, 0.0, -0.120, (float32)0.0, &r);
+  add_galaxy(g, 1 + each, each, 0.8, 0.8, 0.9, 0.6,
+             15.56, 0.0, 0.0, -0.238, 0.0, 0.151, (float32)1.0, &r);
   return g;
 }
 
@@ -313,7 +313,8 @@ fn force_blocks(n: int32) -> int32 {
 }
 
 export fn gal_forces(g: Galaxy*) {
-  dispatch gal_forces_k[force_blocks(g->n), 256](g->d_pos, g->d_acc, g->n, g->eps2, g->holes[0], g->holes[1]);
+  dispatch gal_forces_k[force_blocks(g->n), 256](g->d_pos, g->d_acc, g->n, g->eps2,
+                                                 g->holes[0], g->holes[1]);
 }
 
 export fn gal_step(g: Galaxy*) {

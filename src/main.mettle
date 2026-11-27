@@ -1,6 +1,3 @@
-// two galaxies colliding, gravity and drawing on the GPU
-// flags and keys are in the README
-
 import "std/io";
 import "std/mem";
 import "std/conv";
@@ -55,7 +52,7 @@ fn make_cam(o: Orbit) -> GalCam {
   c.fx = (float32)fx;
   c.fy = (float32)fy;
   c.fz = (float32)fz;
-  c.focal = (float32)((float64)H * 1.07);  // 50 degrees top to bottom
+  c.focal = (float32)((float64)H * 1.07);  // 50 degree view
   c.w = W;
   c.h = H;
   return c;
@@ -69,9 +66,13 @@ fn home() -> Orbit {
   return o;
 }
 
-// total light stays the same whatever the star count
+// same total light at any star count
 fn brightness(n: int32) -> float32 {
   return (float32)(0.9 * 65536.0 / (float64)n);
+}
+
+fn draw(v: GalView*, g: Galaxy*, o: Orbit) -> int32 {
+  return gal_draw(v, g->d_pos, g->d_vel, g->n, make_cam(o), brightness(g->n), (float32)0.5);
 }
 
 fn parse_int(c: cstring) -> int32 {
@@ -99,7 +100,6 @@ fn save_ppm(px: uint8*, path: string) -> bool {
     return false;
   }
 
-  // header and pixels in one buffer for a single write
   var head: string = "P6\n{W} {H}\n255\n";
   var n: int64 = (int64)head.length;
   var pixels: int64 = (int64)W * (int64)H;
@@ -173,16 +173,16 @@ fn headless(stars: int32, steps: int32, out: string, record: string, every: int3
   var v: GalView* = gal_view_new(W, H);
   var o: Orbit = home();
   var frame: int32 = 0;
-  var pending: int32 = -1;  // slot of a recorded frame not saved yet
+  var pending: int32 = -1;  // frame not saved yet
   var t0: float64 = now_ms();
 
   for s in 0..steps {
     gal_step(g);
     if (record.length > (uint64)0 && s % every == 0) {
       o.yaw = o.yaw + 0.0015 * (float64)every;
-      var drawn: int32 = gal_draw(v, g->d_pos, g->d_vel, g->n, make_cam(o), brightness(g->n), (float32)0.5);
+      var drawn: int32 = draw(v, g, o);
 
-      // save the last frame while the GPU works on this one
+      // save the last frame while this one draws
       if (pending >= 0) {
         save_ppm(gal_frame(v, pending), frame_path(record, frame));
         frame += 1;
@@ -195,9 +195,10 @@ fn headless(stars: int32, steps: int32, out: string, record: string, every: int3
     frame += 1;
   }
 
-  var last: int32 = gal_draw(v, g->d_pos, g->d_vel, g->n, make_cam(o), brightness(g->n), (float32)0.5);
+  var last: int32 = draw(v, g, o);
   save_ppm(gal_frame(v, last), out);
-  println("{g->n} stars, {steps} steps to time {(int32)g->time} in {fixed1(now_ms() - t0)} ms, {frame} frames saved");
+  var ms: string = fixed1(now_ms() - t0);
+  println("{g->n} stars, {steps} steps to time {(int32)g->time} in {ms} ms, {frame} frames saved");
 
   gal_view_free(v);
   gal_free(g);
@@ -283,10 +284,10 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   var paused: bool = false;
   var spin: bool = true;
   var dragging: bool = false;
-  var dirty: bool = true;  // something changed, so draw a frame
+  var dirty: bool = true;
   var lx: float64 = 0.0;
   var ly: float64 = 0.0;
-  var pending: int32 = -1;  // slot of the frame on the GPU
+  var pending: int32 = -1;  // frame on the GPU
   var frames: int32 = 0;
   var gpu_ms: float64 = 0.0;
   var copy_ms: float64 = 0.0;
@@ -298,7 +299,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   while (!window_should_close(win)) {
     var moving: bool = !paused || (spin && !dragging);
 
-    // with nothing to draw or show, sleep until an event
+    // nothing to do, so sleep
     var have: bool = false;
     if (!moving && !dirty && pending < 0) {
       have = window_wait(&ev, 100);
@@ -320,7 +321,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
         } else if (k == WINDOW_KEY_RIGHT_BRACKET && spf < 64) {
           spf += 1;
         } else if (k == WINDOW_KEY_R) {
-          // the queued frame may still read the old stars
+          // a queued frame may still read them
           gpu_sync();
           gal_free(g);
           g = gal_new(stars, (uint64)1);
@@ -363,7 +364,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
       have = window_poll(&ev);
     }
 
-    // queue this frame, then show the last one while the GPU works
+    // show the last frame while this one draws
     var drawn: int32 = -1;
     moving = !paused || (spin && !dragging);
     if (moving || dirty) {
@@ -376,7 +377,7 @@ fn main(argc: int32, argv: cstring*) -> int32 {
       if (spin && !dragging) {
         o.yaw = o.yaw + 0.0012;
       }
-      drawn = gal_draw(v, g->d_pos, g->d_vel, g->n, make_cam(o), brightness(g->n), (float32)0.5);
+      drawn = draw(v, g, o);
       dirty = false;
     }
 
@@ -400,7 +401,9 @@ fn main(argc: int32, argv: cstring*) -> int32 {
       if (frames > 0) {
         var f: float64 = (float64)frames;
         var fps: int32 = (int32)(f * 1000.0 / (t - last_title));
-        var title: string = "Galaxy  {g->n} stars  {fps} fps  {spf} steps a frame  GPU {fixed1(gpu_ms / f)} ms  copy {fixed1(copy_ms / f)} ms  blit {fixed1(blit_ms / f)} ms  time {(int32)g->time}";
+        var title: string = "Galaxy  {g->n} stars  {fps} fps  {spf} steps a frame";
+        title = title + "  GPU {fixed1(gpu_ms / f)} ms  copy {fixed1(copy_ms / f)} ms";
+        title = title + "  blit {fixed1(blit_ms / f)} ms  time {(int32)g->time}";
         window_set_title(win, title);
         println(title);
       }

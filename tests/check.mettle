@@ -1,5 +1,3 @@
-// checks the GPU gravity against the CPU
-
 import "std/io";
 import "std/mem";
 import "std/gpu";
@@ -35,7 +33,7 @@ fn forces_match() {
       hi = 1.0;
     }
 
-    // the star itself adds nothing as its offset is zero
+    // a star's own offset is zero
     for j in 0..g->n {
       var dx: float64 = (float64)g->pos[j * 4] - px;
       var dy: float64 = (float64)g->pos[j * 4 + 1] - py;
@@ -126,7 +124,8 @@ fn energy_holds() {
   if (drift > 0.01) {
     fail("energy drifted by {ppt / 10}.{ppt % 10} per thousand over 3,000 steps");
   } else {
-    println("energy: drifted {ppt / 10}.{ppt % 10} per thousand over 3,000 steps (time {(int32)g->time})");
+    var drift: string = "{ppt / 10}.{ppt % 10}";
+    println("energy: drifted {drift} per thousand over 3,000 steps (time {(int32)g->time})");
   }
 
   gal_free(g);

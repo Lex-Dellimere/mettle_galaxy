@@ -1,4 +1,3 @@
-// two galaxies colliding, run and drawn on the GPU
 import "mbuild/api";
 
 fn project() {
