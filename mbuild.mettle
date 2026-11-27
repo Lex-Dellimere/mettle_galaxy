@@ -1,4 +1,4 @@
-// mettle_galaxy: two galaxies colliding, simulated and drawn by Mettle kernels on the GPU.
+// two galaxies colliding, run and drawn on the GPU
 import "mbuild/api";
 
 fn project() {

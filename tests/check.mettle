@@ -1,6 +1,4 @@
-// Checks the GPU gravity against the CPU.
-//   1. the pull on every star from the GPU kernel matches a CPU sum in float64
-//   2. total energy stays close to where it started over 3,000 steps
+// checks the GPU gravity against the CPU
 
 import "std/io";
 import "std/mem";
@@ -22,56 +20,87 @@ fn forces_match() {
   gpu_sync();
   var acc: float32* = (float32*)malloc((int64)g->n * 16);
   gpu_to_host((uint8*)acc, g->d_acc, (int64)g->n * 16);
+
   var worst: float64 = 0.0;
   var e2: float64 = (float64)g->eps2;
   for i in 0..g->n {
-    var ax: float64 = 0.0; var ay: float64 = 0.0; var az: float64 = 0.0;
-    var px: float64 = (float64)g->pos[i * 4]; var py: float64 = (float64)g->pos[i * 4 + 1]; var pz: float64 = (float64)g->pos[i * 4 + 2];
+    var ax: float64 = 0.0;
+    var ay: float64 = 0.0;
+    var az: float64 = 0.0;
+    var px: float64 = (float64)g->pos[i * 4];
+    var py: float64 = (float64)g->pos[i * 4 + 1];
+    var pz: float64 = (float64)g->pos[i * 4 + 2];
     var hi: float64 = 0.0;
-    if (g->pos[i * 4 + 3] > (float32)0.05) { hi = 1.0; }
+    if (g->pos[i * 4 + 3] > (float32)0.05) {
+      hi = 1.0;
+    }
+
+    // the star itself adds nothing as its offset is zero
     for j in 0..g->n {
       var dx: float64 = (float64)g->pos[j * 4] - px;
       var dy: float64 = (float64)g->pos[j * 4 + 1] - py;
       var dz: float64 = (float64)g->pos[j * 4 + 2] - pz;
       var hj: float64 = 0.0;
-      if (g->pos[j * 4 + 3] > (float32)0.05) { hj = 1.0; }
+      if (g->pos[j * 4 + 3] > (float32)0.05) {
+        hj = 1.0;
+      }
       var r2: float64 = dx * dx + dy * dy + dz * dz + e2 + hi + hj;
       var s: float64 = (float64)g->pos[j * 4 + 3] / (r2 * m.sqrt(r2));
-      ax = ax + dx * s; ay = ay + dy * s; az = az + dz * s;
+      ax = ax + dx * s;
+      ay = ay + dy * s;
+      az = az + dz * s;
     }
+
     var want: float64 = m.sqrt(ax * ax + ay * ay + az * az);
     var ex: float64 = (float64)acc[i * 4] - ax;
     var ey: float64 = (float64)acc[i * 4 + 1] - ay;
     var ez: float64 = (float64)acc[i * 4 + 2] - az;
     var err: float64 = m.sqrt(ex * ex + ey * ey + ez * ez) / (want + 1e-12);
-    if (err > worst) { worst = err; }
+    if (err > worst) {
+      worst = err;
+    }
   }
+
   var ppm: int64 = (int64)(worst * 1000000.0);
-  if (worst > 0.0005) { fail("GPU pull differs from the CPU by {ppm} parts per million"); }
-  else { println("forces: GPU matches the CPU within {ppm} parts per million for {g->n} stars"); }
+  if (worst > 0.0005) {
+    fail("GPU pull differs from the CPU by {ppm} parts per million");
+  } else {
+    println("forces: GPU matches the CPU within {ppm} parts per million for {g->n} stars");
+  }
+
   free((rawptr)acc);
   gal_free(g);
 }
 
+// softened the same way as the kernel
 fn energy(g: Galaxy*) -> float64 {
   var k: float64 = 0.0;
   var u: float64 = 0.0;
   var e2: float64 = (float64)g->eps2;
+
   for i in 0..g->n {
     var mi: float64 = (float64)g->pos[i * 4 + 3];
     var hi: float64 = 0.0;
-    if (g->pos[i * 4 + 3] > (float32)0.05) { hi = 1.0; }
-    var vx: float64 = (float64)g->vel[i * 4]; var vy: float64 = (float64)g->vel[i * 4 + 1]; var vz: float64 = (float64)g->vel[i * 4 + 2];
+    if (g->pos[i * 4 + 3] > (float32)0.05) {
+      hi = 1.0;
+    }
+    var vx: float64 = (float64)g->vel[i * 4];
+    var vy: float64 = (float64)g->vel[i * 4 + 1];
+    var vz: float64 = (float64)g->vel[i * 4 + 2];
     k = k + 0.5 * mi * (vx * vx + vy * vy + vz * vz);
+
     for j in i + 1..g->n {
       var dx: float64 = (float64)(g->pos[j * 4] - g->pos[i * 4]);
       var dy: float64 = (float64)(g->pos[j * 4 + 1] - g->pos[i * 4 + 1]);
       var dz: float64 = (float64)(g->pos[j * 4 + 2] - g->pos[i * 4 + 2]);
       var hj: float64 = 0.0;
-      if (g->pos[j * 4 + 3] > (float32)0.05) { hj = 1.0; }
+      if (g->pos[j * 4 + 3] > (float32)0.05) {
+        hj = 1.0;
+      }
       u = u - mi * (float64)g->pos[j * 4 + 3] / m.sqrt(dx * dx + dy * dy + dz * dz + e2 + hi + hj);
     }
   }
+
   return k + u;
 }
 
@@ -79,23 +108,43 @@ fn energy_holds() {
   var g: Galaxy* = gal_new(4098, (uint64)5);
   gal_upload(g);
   var e0: float64 = energy(g);
-  for s in 0..3000 { gal_step(g); }
+
+  for s in 0..3000 {
+    gal_step(g);
+  }
   gpu_sync();
   gal_download(g);
+
   var e1: float64 = energy(g);
   var drift: float64 = (e1 - e0) / e0;
-  if (drift < 0.0) { drift = -drift; }
+  if (drift < 0.0) {
+    drift = -drift;
+  }
+
+  // tenths of a part per thousand
   var ppt: int64 = (int64)(drift * 1000.0 * 10.0);
-  if (drift > 0.01) { fail("energy drifted by {ppt / 10}.{ppt % 10} per thousand over 3,000 steps"); }
-  else { println("energy: drifted {ppt / 10}.{ppt % 10} per thousand over 3,000 steps (time {(int32)g->time})"); }
+  if (drift > 0.01) {
+    fail("energy drifted by {ppt / 10}.{ppt % 10} per thousand over 3,000 steps");
+  } else {
+    println("energy: drifted {ppt / 10}.{ppt % 10} per thousand over 3,000 steps (time {(int32)g->time})");
+  }
+
   gal_free(g);
 }
 
 fn main() -> int32 {
-  if (gpu_init() == 0) { println("no GPU, nothing to check"); return 1; }
+  if (gpu_init() == 0) {
+    println("no GPU, nothing to check");
+    return 1;
+  }
+
   forces_match();
   energy_holds();
-  if (g_fail > 0) { println("{g_fail} checks failed"); return 1; }
+
+  if (g_fail > 0) {
+    println("{g_fail} checks failed");
+    return 1;
+  }
   println("all checks passed");
   return 0;
 }

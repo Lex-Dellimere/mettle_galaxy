@@ -1,20 +1,23 @@
-// Drawing the stars, also in Mettle kernels on the GPU:
-//   1. splat: each star adds its light to the four pixels around where it
-//      lands, with integer atomics into a light buffer
-//   2. shrink: the light, 4x4 pixels to one, for the glow
-//   3. blur: the small buffer across, then down
-//   4. tone: light and glow to colour, with a soft roll-off so the bright
-//      cores do not clip, packed as RGBA
-// Only the finished picture comes back to the CPU, to be shown.
+// splat the stars, blur a quarter size copy for glow, tone map
+
 import "std/mem";
 import "std/gpu";
 
 export struct GalCam {
-  ex: float32; ey: float32; ez: float32;     // eye
-  rx: float32; ry: float32; rz: float32;     // right
-  ux: float32; uy: float32; uz: float32;     // up
-  fx: float32; fy: float32; fz: float32;     // forward
-  focal: float32;                            // pixels per unit at distance 1
+  // eye, then the right, up and forward axes
+  ex: float32;
+  ey: float32;
+  ez: float32;
+  rx: float32;
+  ry: float32;
+  rz: float32;
+  ux: float32;
+  uy: float32;
+  uz: float32;
+  fx: float32;
+  fy: float32;
+  fz: float32;
+  focal: float32;  // pixels per unit at distance 1
   w: int32;
   h: int32;
 }
@@ -22,55 +25,86 @@ export struct GalCam {
 export struct GalView {
   w: int32;
   h: int32;
-  sw: int32;            // the small buffer for the glow, a quarter of each side
+  sw: int32;  // glow size, a quarter of each side
   sh: int32;
-  d_light: int64;       // uint32 x3 a pixel
-  d_small: int64;       // float32 x3 a small pixel
+  d_light: int64;  // uint32 x3 a pixel
+  d_small: int64;  // float32 x3 a small pixel
   d_tmp: int64;
-  d_out: int64;         // uint32 RGBA a pixel
-  px: uint8*;           // the picture on the CPU
+  d_out: int64;  // uint32 RGBA a pixel
+  px: uint8*;
   exposure: float32;
 }
 
-const LIGHT_ONE: float32 = 256.0;   // light buffer units per unit of light
+// fixed point scale of the light buffer
+const LIGHT_ONE: float32 = 256.0;
 
 kernel(block = 256) gal_clear_k(buf: uint32*, n: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
-  if (i < n) { buf[i] = (uint32)0; }
+  if (i < n) {
+    buf[i] = (uint32)0;
+  }
 }
 
-// Each star: its colour comes from the galaxy it started in, warm white for
-// one and blue white for the other; black holes are brightest.
 kernel(block = 256) gal_splat_k(pos: float32*, vel: float32*, n: int32, cam: GalCam, light: uint32*, bright: float32) {
   var i: int32 = block.x * block_dim.x + thread.x;
-  if (i >= n) { return; }
+  if (i >= n) {
+    return;
+  }
+
   var dx: float32 = pos[i * 4] - cam.ex;
   var dy: float32 = pos[i * 4 + 1] - cam.ey;
   var dz: float32 = pos[i * 4 + 2] - cam.ez;
   var z: float32 = dx * cam.fx + dy * cam.fy + dz * cam.fz;
-  if (z < (float32)0.5) { return; }
+  if (z < (float32)0.5) {
+    return;
+  }
+
   var sx: float32 = (dx * cam.rx + dy * cam.ry + dz * cam.rz) / z * cam.focal + (float32)cam.w * (float32)0.5 - (float32)0.5;
   var sy: float32 = (float32)cam.h * (float32)0.5 - (dx * cam.ux + dy * cam.uy + dz * cam.uz) / z * cam.focal - (float32)0.5;
-  if (sx < (float32)0.0 || sy < (float32)0.0) { return; }
+  if (sx < (float32)0.0 || sy < (float32)0.0) {
+    return;
+  }
   var x0: int32 = (int32)sx;
   var y0: int32 = (int32)sy;
-  if (x0 >= cam.w - 1 || y0 >= cam.h - 1) { return; }
+  if (x0 >= cam.w - 1 || y0 >= cam.h - 1) {
+    return;
+  }
   var tx: float32 = sx - (float32)x0;
   var ty: float32 = sy - (float32)y0;
+
+  // warm white for one galaxy, blue white for the other
   var tag: float32 = vel[i * 4 + 3];
-  var r: float32 = (float32)1.0; var g: float32 = (float32)0.80; var b: float32 = (float32)0.58;
-  if (tag > (float32)0.75) { r = (float32)0.62; g = (float32)0.76; b = (float32)1.0; }
+  var r: float32 = (float32)1.0;
+  var g: float32 = (float32)0.80;
+  var b: float32 = (float32)0.58;
+  if (tag > (float32)0.75) {
+    r = (float32)0.62;
+    g = (float32)0.76;
+    b = (float32)1.0;
+  }
+
+  // tags 0.5 and 1.5 are the black holes
   var k: float32 = bright * LIGHT_ONE;
   var frac: float32 = tag - (float32)(int32)tag;
-  if (frac > (float32)0.25) { k = k * (float32)40.0; r = (float32)1.0; g = (float32)0.95; b = (float32)0.9; }   // a black hole
-  // the four pixels around the star, each weighted by how close it is
+  if (frac > (float32)0.25) {
+    k = k * (float32)40.0;
+    r = (float32)1.0;
+    g = (float32)0.95;
+    b = (float32)0.9;
+  }
+
+  // share the light among the four nearest pixels
   for c in 0..4 {
     var cx: int32 = c & 1;
     var cy: int32 = c >> 1;
     var wx: float32 = (float32)1.0 - tx;
-    if (cx == 1) { wx = tx; }
+    if (cx == 1) {
+      wx = tx;
+    }
     var wy: float32 = (float32)1.0 - ty;
-    if (cy == 1) { wy = ty; }
+    if (cy == 1) {
+      wy = ty;
+    }
     var kk: float32 = k * wx * wy;
     var o: int64 = ((int64)(y0 + cy) * (int64)cam.w + (int64)(x0 + cx)) * 3;
     atomic_fetch_add(light, o, (uint32)(r * kk), order: relaxed, scope: device);
@@ -81,10 +115,15 @@ kernel(block = 256) gal_splat_k(pos: float32*, vel: float32*, n: int32, cam: Gal
 
 kernel(block = 256) gal_shrink_k(light: uint32*, w: int32, small: float32*, sw: int32, sh: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
-  if (i >= sw * sh) { return; }
+  if (i >= sw * sh) {
+    return;
+  }
+
   var x: int32 = i % sw;
   var y: int32 = i / sw;
-  var r: float32 = (float32)0.0; var g: float32 = (float32)0.0; var b: float32 = (float32)0.0;
+  var r: float32 = (float32)0.0;
+  var g: float32 = (float32)0.0;
+  var b: float32 = (float32)0.0;
   for dy in 0..4 {
     for dx in 0..4 {
       var o: int64 = ((int64)(y * 4 + dy) * (int64)w + (int64)(x * 4 + dx)) * 3;
@@ -93,63 +132,98 @@ kernel(block = 256) gal_shrink_k(light: uint32*, w: int32, small: float32*, sw: 
       b = b + (float32)light[o + 2];
     }
   }
+
   small[i * 3] = r / (float32)16.0;
   small[i * 3 + 1] = g / (float32)16.0;
   small[i * 3 + 2] = b / (float32)16.0;
 }
 
-// A wide blur along one axis (dx, dy is 1, 0 or 0, 1), weights falling off
-// like a Gaussian over 12 small pixels each side.
+// blur along (dx, dy), 12 small pixels each side
 kernel(block = 256) gal_blur_k(src: float32*, dst: float32*, sw: int32, sh: int32, dx: int32, dy: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
-  if (i >= sw * sh) { return; }
+  if (i >= sw * sh) {
+    return;
+  }
+
   var x: int32 = i % sw;
   var y: int32 = i / sw;
-  var r: float32 = (float32)0.0; var g: float32 = (float32)0.0; var b: float32 = (float32)0.0;
+  var r: float32 = (float32)0.0;
+  var g: float32 = (float32)0.0;
+  var b: float32 = (float32)0.0;
   var total: float32 = (float32)0.0;
   for k in -12..13 {
     var xx: int32 = x + k * dx;
     var yy: int32 = y + k * dy;
-    if (xx < 0 || yy < 0 || xx >= sw || yy >= sh) { continue; }
+    if (xx < 0 || yy < 0 || xx >= sw || yy >= sh) {
+      continue;
+    }
     var t: float32 = (float32)k / (float32)6.0;
     var wgt: float32 = expf(-t * t);
     var o: int32 = (yy * sw + xx) * 3;
-    r = r + src[o] * wgt; g = g + src[o + 1] * wgt; b = b + src[o + 2] * wgt;
+    r = r + src[o] * wgt;
+    g = g + src[o + 1] * wgt;
+    b = b + src[o + 2] * wgt;
     total = total + wgt;
   }
+
   dst[i * 3] = r / total;
   dst[i * 3 + 1] = g / total;
   dst[i * 3 + 2] = b / total;
 }
 
+// soft roll off so bright cores do not clip, then a square root
 fn tone(v: float32) -> uint32 {
-  // 1 - exp(-v) keeps bright cores from clipping, then a square root for display
   var c: float32 = (float32)1.0 - expf(-v);
-  if (c < (float32)0.0) { c = (float32)0.0; }
+  if (c < (float32)0.0) {
+    c = (float32)0.0;
+  }
   var s: float32 = sqrtf(c) * (float32)255.0 + (float32)0.5;
-  if (s > (float32)255.0) { s = (float32)255.0; }
+  if (s > (float32)255.0) {
+    s = (float32)255.0;
+  }
   return (uint32)s;
 }
 
 kernel(block = 256) gal_tone_k(light: uint32*, small: float32*, w: int32, h: int32, sw: int32, sh: int32, out: uint32*, exposure: float32, glow: float32) {
   var i: int32 = block.x * block_dim.x + thread.x;
-  if (i >= w * h) { return; }
+  if (i >= w * h) {
+    return;
+  }
   var x: int32 = i % w;
   var y: int32 = i / w;
-  // the glow at this pixel, between the four small pixels around it
+
+  // the glow here, between the four small pixels around it
   var fx: float32 = ((float32)x + (float32)0.5) / (float32)4.0 - (float32)0.5;
   var fy: float32 = ((float32)y + (float32)0.5) / (float32)4.0 - (float32)0.5;
-  if (fx < (float32)0.0) { fx = (float32)0.0; }
-  if (fy < (float32)0.0) { fy = (float32)0.0; }
-  var x0: int32 = (int32)fx; var y0: int32 = (int32)fy;
-  var x1: int32 = x0 + 1; var y1: int32 = y0 + 1;
-  if (x0 > sw - 1) { x0 = sw - 1; }
-  if (y0 > sh - 1) { y0 = sh - 1; }
-  if (x1 > sw - 1) { x1 = sw - 1; }
-  if (y1 > sh - 1) { y1 = sh - 1; }
-  var tx: float32 = fx - (float32)x0; var ty: float32 = fy - (float32)y0;
-  var o00: int32 = (y0 * sw + x0) * 3; var o10: int32 = (y0 * sw + x1) * 3;
-  var o01: int32 = (y1 * sw + x0) * 3; var o11: int32 = (y1 * sw + x1) * 3;
+  if (fx < (float32)0.0) {
+    fx = (float32)0.0;
+  }
+  if (fy < (float32)0.0) {
+    fy = (float32)0.0;
+  }
+  var x0: int32 = (int32)fx;
+  var y0: int32 = (int32)fy;
+  var x1: int32 = x0 + 1;
+  var y1: int32 = y0 + 1;
+  if (x0 > sw - 1) {
+    x0 = sw - 1;
+  }
+  if (y0 > sh - 1) {
+    y0 = sh - 1;
+  }
+  if (x1 > sw - 1) {
+    x1 = sw - 1;
+  }
+  if (y1 > sh - 1) {
+    y1 = sh - 1;
+  }
+
+  var tx: float32 = fx - (float32)x0;
+  var ty: float32 = fy - (float32)y0;
+  var o00: int32 = (y0 * sw + x0) * 3;
+  var o10: int32 = (y0 * sw + x1) * 3;
+  var o01: int32 = (y1 * sw + x0) * 3;
+  var o11: int32 = (y1 * sw + x1) * 3;
   var a: float32 = ((float32)1.0 - tx) * ((float32)1.0 - ty);
   var bq: float32 = tx * ((float32)1.0 - ty);
   var c: float32 = ((float32)1.0 - tx) * ty;
@@ -157,6 +231,8 @@ kernel(block = 256) gal_tone_k(light: uint32*, small: float32*, w: int32, h: int
   var gr: float32 = small[o00] * a + small[o10] * bq + small[o01] * c + small[o11] * d;
   var gg: float32 = small[o00 + 1] * a + small[o10 + 1] * bq + small[o01 + 1] * c + small[o11 + 1] * d;
   var gb: float32 = small[o00 + 2] * a + small[o10 + 2] * bq + small[o01 + 2] * c + small[o11 + 2] * d;
+
+  // the small constants give a faint blue sky
   var o: int64 = (int64)i * 3;
   var s: float32 = exposure / LIGHT_ONE;
   var r: float32 = ((float32)light[o] + gr * glow) * s + (float32)0.0012;
@@ -171,29 +247,37 @@ export fn gal_view_new(w: int32, h: int32) -> GalView* {
   v->h = h;
   v->sw = w / 4;
   v->sh = h / 4;
+
   v->d_light = gpu_malloc((int64)w * (int64)h * 12);
   v->d_small = gpu_malloc((int64)v->sw * (int64)v->sh * 12);
   v->d_tmp = gpu_malloc((int64)v->sw * (int64)v->sh * 12);
   v->d_out = gpu_malloc((int64)w * (int64)h * 4);
+
   v->px = (uint8*)malloc((int64)w * (int64)h * 4);
   v->exposure = (float32)1.0;
   return v;
 }
 
 export fn gal_view_free(v: GalView*) {
-  gpu_free(v->d_light); gpu_free(v->d_small); gpu_free(v->d_tmp); gpu_free(v->d_out);
+  gpu_free(v->d_light);
+  gpu_free(v->d_small);
+  gpu_free(v->d_tmp);
+  gpu_free(v->d_out);
   free((rawptr)v->px);
   free((rawptr)v);
 }
 
-// Draw the stars at d_pos / d_vel from the camera, and bring the picture back into v->px.
+// copies the finished frame back into px
 export fn gal_draw(v: GalView*, d_pos: int64, d_vel: int64, n: int32, cam: GalCam, bright: float32, glow: float32) {
   var nl: int32 = v->w * v->h * 3;
   dispatch gal_clear_k[work: nl](v->d_light, nl);
   dispatch gal_splat_k[work: n](d_pos, d_vel, n, cam, v->d_light, bright);
+
+  // the glow, blurred across then down
   dispatch gal_shrink_k[work: v->sw * v->sh](v->d_light, v->w, v->d_small, v->sw, v->sh);
   dispatch gal_blur_k[work: v->sw * v->sh](v->d_small, v->d_tmp, v->sw, v->sh, 1, 0);
   dispatch gal_blur_k[work: v->sw * v->sh](v->d_tmp, v->d_small, v->sw, v->sh, 0, 1);
+
   dispatch gal_tone_k[work: v->w * v->h](v->d_light, v->d_small, v->w, v->h, v->sw, v->sh, v->d_out, v->exposure, glow);
   gpu_to_host(v->px, v->d_out, (int64)v->w * (int64)v->h * 4);
 }
