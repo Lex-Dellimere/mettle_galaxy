@@ -16,10 +16,11 @@ export struct Galaxy {
   eps2: float32;  // softening squared
   dt: float32;
   time: float64;
+  holes: int32[2];  // where the two black holes sit
 }
 
 // tiles of 256 stars so each block shares its loads
-kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: float32) {
+kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: float32, hole0: int32, hole1: int32) {
   workgroup var sx: float32[256];
   workgroup var sy: float32[256];
   workgroup var sz: float32[256];
@@ -69,7 +70,13 @@ kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: f
       sx[thread.x] = pos[j * 4];
       sy[thread.x] = pos[j * 4 + 1];
       sz[thread.x] = pos[j * 4 + 2];
-      sm[thread.x] = pos[j * 4 + 3];
+
+      // the black holes weigh nothing here and pull after the tiles
+      var mj: float32 = pos[j * 4 + 3];
+      if (j == hole0 || j == hole1) {
+        mj = (float32)0.0;
+      }
+      sm[thread.x] = mj;
     } else {
       sx[thread.x] = (float32)0.0;
       sy[thread.x] = (float32)0.0;
@@ -83,15 +90,11 @@ kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: f
       var y: float32 = sy[k];
       var z: float32 = sz[k];
       var mk: float32 = sm[k];
-      var hk: float32 = (float32)0.0;
-      if (mk > (float32)0.05) {
-        hk = (float32)1.0;
-      }
 
       var dx: float32 = x - px;
       var dy: float32 = y - py;
       var dz: float32 = z - pz;
-      var inv: float32 = rsqrtf(dx * dx + dy * dy + dz * dz + eps2 + hk + hp);
+      var inv: float32 = rsqrtf(dx * dx + dy * dy + dz * dz + eps2 + hp);
       var s: float32 = mk * inv * inv * inv;
       ax = ax + dx * s;
       ay = ay + dy * s;
@@ -100,13 +103,43 @@ kernel(block = 256) gal_forces_k(pos: float32*, acc: float32*, n: int32, eps2: f
       var ex: float32 = x - qx;
       var ey: float32 = y - qy;
       var ez: float32 = z - qz;
-      var inv2: float32 = rsqrtf(ex * ex + ey * ey + ez * ez + eps2 + hk + hq);
+      var inv2: float32 = rsqrtf(ex * ex + ey * ey + ez * ez + eps2 + hq);
       var s2: float32 = mk * inv2 * inv2 * inv2;
       bx = bx + ex * s2;
       by = by + ey * s2;
       bz = bz + ez * s2;
     }
     barrier(workgroup, acq_rel);
+  }
+
+  // the two black holes, softened one unit more
+  for h in 0..2 {
+    var c: int32 = hole0;
+    if (h == 1) {
+      c = hole1;
+    }
+    var x: float32 = pos[c * 4];
+    var y: float32 = pos[c * 4 + 1];
+    var z: float32 = pos[c * 4 + 2];
+    var mk: float32 = pos[c * 4 + 3];
+
+    var dx: float32 = x - px;
+    var dy: float32 = y - py;
+    var dz: float32 = z - pz;
+    var inv: float32 = rsqrtf(dx * dx + dy * dy + dz * dz + eps2 + (float32)1.0 + hp);
+    var s: float32 = mk * inv * inv * inv;
+    ax = ax + dx * s;
+    ay = ay + dy * s;
+    az = az + dz * s;
+
+    var ex: float32 = x - qx;
+    var ey: float32 = y - qy;
+    var ez: float32 = z - qz;
+    var inv2: float32 = rsqrtf(ex * ex + ey * ey + ez * ez + eps2 + (float32)1.0 + hq);
+    var s2: float32 = mk * inv2 * inv2 * inv2;
+    bx = bx + ex * s2;
+    by = by + ey * s2;
+    bz = bz + ez * s2;
   }
 
   if (i < n) {
@@ -235,6 +268,8 @@ export fn gal_new(stars: int32, seed: uint64) -> Galaxy* {
   var g: Galaxy* = new Galaxy;
   var each: int32 = (stars - 2) / 2;
   g->n = 2 + each * 2;
+  g->holes[0] = 0;
+  g->holes[1] = 1 + each;
   g->pos = (float32*)calloc((int64)g->n * 4, 4);
   g->vel = (float32*)calloc((int64)g->n * 4, 4);
   g->eps2 = (float32)0.04;
@@ -278,11 +313,11 @@ fn force_blocks(n: int32) -> int32 {
 }
 
 export fn gal_forces(g: Galaxy*) {
-  dispatch gal_forces_k[force_blocks(g->n), 256](g->d_pos, g->d_acc, g->n, g->eps2);
+  dispatch gal_forces_k[force_blocks(g->n), 256](g->d_pos, g->d_acc, g->n, g->eps2, g->holes[0], g->holes[1]);
 }
 
 export fn gal_step(g: Galaxy*) {
-  dispatch gal_forces_k[force_blocks(g->n), 256](g->d_pos, g->d_acc, g->n, g->eps2);
+  gal_forces(g);
   dispatch gal_move_k[work: g->n](g->d_pos, g->d_vel, g->d_acc, g->n, g->dt);
   g->time = g->time + (float64)g->dt;
 }

@@ -6,7 +6,7 @@ Every star pulls on every other star. The gravity kernel works in tiles: a block
 
 The galaxies start on a parabolic orbit that brings them within about 8 units of each other, with the bigger one spinning the same way it orbits, the setup Toomre and Toomre used in 1972 to explain long tidal tails. Each has a black hole at its centre that pulls softly inside one unit, so stars that pass close are not flung away.
 
-The drawing is four more kernels: each star adds its light to the four pixels around where it lands, a quarter-size copy of the light is blurred for the glow, and a tone curve turns light into colour without clipping the bright cores. Only the finished picture comes back to the CPU.
+The drawing is four more kernels: each star adds its light to the four pixels around where it lands, a quarter-size copy of the light is blurred for the glow, and a tone curve turns light into colour without clipping the bright cores. Only the finished picture comes back to the CPU. It copies into one of two pinned buffers while the GPU works on the next frame, and nothing is drawn while the view is still.
 
 ## Build and run
 

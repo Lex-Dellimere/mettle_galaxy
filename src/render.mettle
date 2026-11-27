@@ -31,19 +31,17 @@ export struct GalView {
   d_small: int64;  // float32 x3 a small pixel
   d_tmp: int64;
   d_out: int64;  // uint32 RGBA a pixel
-  px: uint8*;
+  d_weights: int64;  // the 25 blur weights
+  px: uint8*;  // two pinned frames, one per slot
   exposure: float32;
+  slot: int32;  // where the next frame goes
+  start: int64[2];  // timing events, one per slot
+  drawn: int64[2];
+  copied: int64[2];
 }
 
 // fixed point scale of the light buffer
 const LIGHT_ONE: float32 = 256.0;
-
-kernel(block = 256) gal_clear_k(buf: uint32*, n: int32) {
-  var i: int32 = block.x * block_dim.x + thread.x;
-  if (i < n) {
-    buf[i] = (uint32)0;
-  }
-}
 
 kernel(block = 256) gal_splat_k(pos: float32*, vel: float32*, n: int32, cam: GalCam, light: uint32*, bright: float32) {
   var i: int32 = block.x * block_dim.x + thread.x;
@@ -138,8 +136,18 @@ kernel(block = 256) gal_shrink_k(light: uint32*, w: int32, small: float32*, sw: 
   small[i * 3 + 2] = b / (float32)16.0;
 }
 
+// worked out once on the GPU so they match its expf
+kernel(block = 32) gal_weights_k(weights: float32*) {
+  var k: int32 = thread.x;
+  if (k >= 25) {
+    return;
+  }
+  var t: float32 = (float32)(k - 12) / (float32)6.0;
+  weights[k] = expf(-t * t);
+}
+
 // blur along (dx, dy), 12 small pixels each side
-kernel(block = 256) gal_blur_k(src: float32*, dst: float32*, sw: int32, sh: int32, dx: int32, dy: int32) {
+kernel(block = 256) gal_blur_k(src: float32*, dst: float32*, weights: float32*, sw: int32, sh: int32, dx: int32, dy: int32) {
   var i: int32 = block.x * block_dim.x + thread.x;
   if (i >= sw * sh) {
     return;
@@ -157,8 +165,7 @@ kernel(block = 256) gal_blur_k(src: float32*, dst: float32*, sw: int32, sh: int3
     if (xx < 0 || yy < 0 || xx >= sw || yy >= sh) {
       continue;
     }
-    var t: float32 = (float32)k / (float32)6.0;
-    var wgt: float32 = expf(-t * t);
+    var wgt: float32 = weights[k + 12];
     var o: int32 = (yy * sw + xx) * 3;
     r = r + src[o] * wgt;
     g = g + src[o + 1] * wgt;
@@ -241,6 +248,13 @@ kernel(block = 256) gal_tone_k(light: uint32*, small: float32*, w: int32, h: int
   out[i] = tone(r) | (tone(g) << (uint32)8) | (tone(b) << (uint32)16) | (uint32)0xFF000000;
 }
 
+// an event the CPU sleeps on while it waits
+fn sleep_event() -> int64 {
+  var e: int64 = 0;
+  cuEventCreate(&e, (uint32)1);
+  return e;
+}
+
 export fn gal_view_new(w: int32, h: int32) -> GalView* {
   var v: GalView* = new GalView;
   v->w = w;
@@ -252,9 +266,21 @@ export fn gal_view_new(w: int32, h: int32) -> GalView* {
   v->d_small = gpu_malloc((int64)v->sw * (int64)v->sh * 12);
   v->d_tmp = gpu_malloc((int64)v->sw * (int64)v->sh * 12);
   v->d_out = gpu_malloc((int64)w * (int64)h * 4);
+  v->d_weights = gpu_malloc(25 * 4);
+  dispatch gal_weights_k[1, 32](v->d_weights);
 
-  v->px = (uint8*)malloc((int64)w * (int64)h * 4);
+  // pinned, so the copy back runs while the CPU does other work
+  var p: int64 = 0;
+  cuMemHostAlloc(&p, (int64)w * (int64)h * 8, (uint32)0);
+  v->px = (uint8*)p;
   v->exposure = (float32)1.0;
+
+  v->slot = 0;
+  for s in 0..2 {
+    v->start[s] = gpu_event_create();
+    v->drawn[s] = gpu_event_create();
+    v->copied[s] = sleep_event();
+  }
   return v;
 }
 
@@ -263,21 +289,50 @@ export fn gal_view_free(v: GalView*) {
   gpu_free(v->d_small);
   gpu_free(v->d_tmp);
   gpu_free(v->d_out);
-  free((rawptr)v->px);
+  gpu_free(v->d_weights);
+  gpu_host_free(v->px);
+  for s in 0..2 {
+    gpu_event_destroy(v->start[s]);
+    gpu_event_destroy(v->drawn[s]);
+    gpu_event_destroy(v->copied[s]);
+  }
   free((rawptr)v);
 }
 
-// copies the finished frame back into px
-export fn gal_draw(v: GalView*, d_pos: int64, d_vel: int64, n: int32, cam: GalCam, bright: float32, glow: float32) {
-  var nl: int32 = v->w * v->h * 3;
-  dispatch gal_clear_k[work: nl](v->d_light, nl);
+// times the GPU work of the next frame from here
+export fn gal_view_start(v: GalView*) {
+  gpu_event_record(v->start[v->slot], 0);
+}
+
+// queues a frame and returns its slot without waiting
+export fn gal_draw(v: GalView*, d_pos: int64, d_vel: int64, n: int32, cam: GalCam, bright: float32, glow: float32) -> int32 {
+  var s: int32 = v->slot;
+  gpu_memset_u32(v->d_light, (uint32)0, (int64)v->w * (int64)v->h * 3);
   dispatch gal_splat_k[work: n](d_pos, d_vel, n, cam, v->d_light, bright);
 
   // the glow, blurred across then down
   dispatch gal_shrink_k[work: v->sw * v->sh](v->d_light, v->w, v->d_small, v->sw, v->sh);
-  dispatch gal_blur_k[work: v->sw * v->sh](v->d_small, v->d_tmp, v->sw, v->sh, 1, 0);
-  dispatch gal_blur_k[work: v->sw * v->sh](v->d_tmp, v->d_small, v->sw, v->sh, 0, 1);
+  dispatch gal_blur_k[work: v->sw * v->sh](v->d_small, v->d_tmp, v->d_weights, v->sw, v->sh, 1, 0);
+  dispatch gal_blur_k[work: v->sw * v->sh](v->d_tmp, v->d_small, v->d_weights, v->sw, v->sh, 0, 1);
 
   dispatch gal_tone_k[work: v->w * v->h](v->d_light, v->d_small, v->w, v->h, v->sw, v->sh, v->d_out, v->exposure, glow);
-  gpu_to_host(v->px, v->d_out, (int64)v->w * (int64)v->h * 4);
+  gpu_event_record(v->drawn[s], 0);
+
+  var bytes: int64 = (int64)v->w * (int64)v->h * 4;
+  gpu_to_host_async(&v->px[(int64)s * bytes], v->d_out, bytes, 0);
+  gpu_event_record(v->copied[s], 0);
+  v->slot = 1 - s;
+  return s;
+}
+
+// waits for the frame in slot s and returns its pixels
+export fn gal_frame(v: GalView*, s: int32) -> uint8* {
+  gpu_event_sync(v->copied[s]);
+  return &v->px[(int64)s * (int64)v->w * (int64)v->h * 4];
+}
+
+// milliseconds of GPU work and of the copy for slot s
+export fn gal_times(v: GalView*, s: int32, gpu_ms: float32*, copy_ms: float32*) {
+  gpu_event_elapsed_ms(v->start[s], v->drawn[s], gpu_ms);
+  gpu_event_elapsed_ms(v->drawn[s], v->copied[s], copy_ms);
 }
